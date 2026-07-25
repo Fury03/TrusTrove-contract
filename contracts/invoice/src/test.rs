@@ -370,6 +370,60 @@ fn test_trigger_default_requires_past_due_date() {
     assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Defaulted);
 }
 
+// ============== ISSUE #211: trigger_default FROM INVALID STATUSES ==============
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_trigger_default_from_created_rejected() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + 86400;
+    let invoice_id = client.create(&issuer, &buyer, &1_000_000_000, &due_date, &usdc);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Created);
+
+    // A freshly created invoice is not Funded/Active/Confirmed, so defaulting
+    // it must be rejected with InvalidStatusTransition (#8).
+    env.ledger().set_timestamp(due_date + 1);
+    client.trigger_default(&invoice_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_trigger_default_from_listed_rejected() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + 86400;
+    let invoice_id = client.create(&issuer, &buyer, &1_000_000_000, &due_date, &usdc);
+    client.list_for_financing(&invoice_id, &200);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Listed);
+
+    // A Listed invoice has not been funded, so defaulting it must be rejected
+    // with InvalidStatusTransition (#8).
+    env.ledger().set_timestamp(due_date + 1);
+    client.trigger_default(&invoice_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_trigger_default_from_repaid_rejected() {
+    let (env, client, issuer, buyer, _, usdc) = setup();
+    let due_date = env.ledger().timestamp() + 86400;
+    let invoice_id = client.create(&issuer, &buyer, &1_000_000_000, &due_date, &usdc);
+    client.list_for_financing(&invoice_id, &200);
+
+    let pool_id = mock_pool_with_asset(&env, &usdc);
+    client.set_pool_contract(&pool_id);
+    client.mark_funded(&invoice_id, &pool_id, &usdc, &980_000_000);
+    client.mark_shipped(&invoice_id);
+    client.confirm_delivery(&invoice_id, &issuer);
+    client.confirm_delivery(&invoice_id, &buyer);
+    client.repay(&invoice_id);
+    assert_eq!(client.get(&invoice_id).status, InvoiceStatus::Repaid);
+
+    // A Repaid invoice is terminal, so defaulting it must be rejected with
+    // InvalidStatusTransition (#8).
+    env.ledger().set_timestamp(due_date + 1);
+    client.trigger_default(&invoice_id);
+}
+
 #[test]
 fn test_get_by_status_filters_correctly() {
     let (env, client, issuer, buyer, _, usdc) = setup();
