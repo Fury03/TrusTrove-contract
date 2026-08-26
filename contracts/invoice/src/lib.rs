@@ -849,6 +849,8 @@ impl InvoiceContract {
     /// * `InvoiceError::NotFound` if the invoice cannot be found, or if the invoice has no
     ///   recorded funding pool or funding timestamp.
     /// * `InvoiceError::InvalidStatusTransition` if invoice status is not `Confirmed`.
+    /// * `InvoiceError::CrossContractCallFailed` if escrow or pool repayment accounting
+    ///   returns `false`.
     ///
     /// # Returns
     /// * `bool` - `true` when repayment is completed.
@@ -935,8 +937,11 @@ impl InvoiceContract {
         let mut escrow_args = Vec::new(&env);
         escrow_args.push_back(invoice_id.clone().into_val(&env));
         escrow_args.push_back(face_value.into_val(&env));
-        let _: bool =
+        let escrow_released: bool =
             env.invoke_contract(&escrow, &Symbol::new(&env, "release_to_pool"), escrow_args);
+        if !escrow_released {
+            panic_with_error!(&env, InvoiceError::CrossContractCallFailed);
+        }
 
         // Step 3: notify pool to update its internal accounting
         let mut args = Vec::new(&env);
@@ -944,11 +949,14 @@ impl InvoiceContract {
         args.push_back(face_value.into_val(&env));
         args.push_back(refund_to_buyer.into_val(&env));
         args.push_back(buyer.into_val(&env));
-        let _: bool = env.invoke_contract(
+        let repayment_recorded: bool = env.invoke_contract(
             &pool,
             &Symbol::new(&env, "receive_repayment_with_refund"),
             args,
         );
+        if !repayment_recorded {
+            panic_with_error!(&env, InvoiceError::CrossContractCallFailed);
+        }
 
         let mut updated = invoice;
         updated.status = InvoiceStatus::Repaid;
@@ -961,6 +969,12 @@ impl InvoiceContract {
         true
     }
 
+    /// # Panics
+    /// * `InvoiceError::NotFound` if the invoice, funding pool, escrow, or funding timestamp
+    ///   cannot be found.
+    /// * `InvoiceError::InvalidStatusTransition` if the invoice is not `Confirmed` or is past due.
+    /// * `InvoiceError::CrossContractCallFailed` if escrow or pool repayment accounting
+    ///   returns `false`.
     pub fn repay_early(env: Env, invoice_id: BytesN<32>) -> bool {
         let inv_key = DataKey::Invoice(invoice_id.clone());
         let invoice: Invoice = env
@@ -1023,8 +1037,11 @@ impl InvoiceContract {
         let mut escrow_args = Vec::new(&env);
         escrow_args.push_back(invoice_id.clone().into_val(&env));
         escrow_args.push_back(face_value.into_val(&env));
-        let _: bool =
+        let escrow_released: bool =
             env.invoke_contract(&escrow, &Symbol::new(&env, "release_to_pool"), escrow_args);
+        if !escrow_released {
+            panic_with_error!(&env, InvoiceError::CrossContractCallFailed);
+        }
 
         // Step 3: notify pool to update its internal accounting
         let mut args = Vec::new(&env);
@@ -1032,11 +1049,14 @@ impl InvoiceContract {
         args.push_back(face_value.into_val(&env));
         args.push_back(refund_to_buyer.into_val(&env));
         args.push_back(buyer.into_val(&env));
-        let _: bool = env.invoke_contract(
+        let repayment_recorded: bool = env.invoke_contract(
             &pool,
             &Symbol::new(&env, "receive_repayment_with_refund"),
             args,
         );
+        if !repayment_recorded {
+            panic_with_error!(&env, InvoiceError::CrossContractCallFailed);
+        }
 
         let mut updated = invoice;
         updated.status = InvoiceStatus::Repaid;
@@ -1074,6 +1094,8 @@ impl InvoiceContract {
     /// * `InvoiceError::InvalidStatusTransition` if invoice is not `Funded`, `Active`, or `Confirmed`.
     /// * `InvoiceError::DueDateNotPassed` if `now < due_date` — the due date
     ///   has not yet been reached.
+    /// * `InvoiceError::CrossContractCallFailed` if the pool returns `false` from
+    ///   `handle_default`.
     ///
     /// # Returns
     /// * `bool` - `true` when default processing succeeds.
@@ -1100,15 +1122,18 @@ impl InvoiceContract {
     /// * `InvoiceError::InvalidStatusTransition` if invoice is not `Funded`, `Active`, or `Confirmed`.
     /// * `InvoiceError::DueDateNotPassed` if `now < due_date` — the due date
     ///   has not yet been reached.
+    /// * `InvoiceError::CrossContractCallFailed` if the pool returns `false` from
+    ///   `handle_default`.
     ///
     /// # Coupling with escrow's minimum lock window
     /// This function's due-date gate (`now >= due_date`) is independent of,
     /// and has no awareness of, the escrow contract's own
     /// `DEFAULT_MIN_LOCK_SECONDS` grace period (60s from the escrow lock
     /// timestamp, roughly `funded_at`). If `due_date` is reached less than
-    /// that window after the invoice was funded, this call sets the invoice's
-    /// local status to `Defaulted` and then transitively invokes
-    /// `escrow.handle_default()` (via `pool.handle_default`), which panics
+    /// that window after the invoice was funded, the downstream default call
+    /// may panic from the escrow constraint. The whole transaction reverts, so
+    /// the invoice remains unchanged. The call transitively invokes
+    /// `escrow.handle_default()` (via `pool.handle_default`), which may panic
     /// with `EscrowError::NotAuthorized`. The whole transaction reverts, so
     /// there is no persistent state inconsistency, but the caller sees a
     /// revert originating from a constraint this contract does not itself
@@ -1142,19 +1167,31 @@ impl InvoiceContract {
         }
 
         let prev_status = invoice.status;
-        invoice.status = InvoiceStatus::Defaulted;
-        Self::save_invoice(&env, inv_key, &invoice);
-        Self::extend_instance_ttl(&env);
-
-        move_status_index(&env, &invoice_id, prev_status, InvoiceStatus::Defaulted);
 
         let pool: Address = invoice
             .funding_pool
+            .clone()
             .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotFound));
         let mut args = Vec::new(&env);
         args.push_back(invoice_id.clone().into_val(&env));
-        let _: bool = env.invoke_contract(&pool, &Symbol::new(&env, "handle_default"), args);
-        events::invoice_defaulted(&env, &invoice_id);
+        let default_handled: bool =
+            env.invoke_contract(&pool, &Symbol::new(&env, "handle_default"), args);
+        if !default_handled {
+            panic_with_error!(&env, InvoiceError::CrossContractCallFailed);
+        }
+
+        let current: Invoice = env
+            .storage()
+            .persistent()
+            .get(&inv_key)
+            .unwrap_or_else(|| panic_with_error!(&env, InvoiceError::NotFound));
+        if current.status == prev_status {
+            invoice.status = InvoiceStatus::Defaulted;
+            Self::save_invoice(&env, inv_key, &invoice);
+            Self::extend_instance_ttl(&env);
+            move_status_index(&env, &invoice_id, prev_status, InvoiceStatus::Defaulted);
+            events::invoice_defaulted(&env, &invoice_id);
+        }
         true
     }
 
