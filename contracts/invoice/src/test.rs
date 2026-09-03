@@ -11,8 +11,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    InvoiceContract, InvoiceContractClient, InvoiceStatus, MAX_FACE_VALUE,
-    TTL_EXTEND_TO, TTL_THRESHOLD,
+    InvoiceContract, InvoiceContractClient, InvoiceStatus, MAX_FACE_VALUE, TTL_EXTEND_TO,
+    TTL_THRESHOLD,
 };
 
 // Default invoice parameters used across tests.
