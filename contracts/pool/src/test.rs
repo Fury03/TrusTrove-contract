@@ -2498,6 +2498,209 @@ fn test_receive_repayment_with_refund_zero_refund_matches_receive_repayment() {
     );
 }
 
+//  ISSUE #967: REPAYMENT YIELD CREDIT OVERFLOW IS TYPED AND ATOMIC //
+// `settle_repayment` credits `lp_yield` to `TotalDeposits` and
+// `TotalYieldDistributed` through checked additions. A boundary-seeded total
+// must surface the typed `PoolError::Overflow` (#13) instead of wrapping —
+// and it must do so before the treasury transfer, before any totals are
+// written, and before the funded invoice entry is removed, so a rejected
+// settlement leaves accounting and persistent state exactly as it was.
+
+#[test]
+fn test_receive_repayment_overflow_total_deposits_preserves_state() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    te.pool.fund_invoice(&invoice_id);
+
+    // Seed TotalDeposits at the boundary: any positive yield credit overflows.
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalDeposits, &u128::MAX);
+    });
+
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let before = te.pool.get_stats();
+    let pool_balance_before = usdc.balance(&te.pool_id);
+    let events_before = te.env.events().all().len();
+
+    // A full face-value repayment carries DEFAULT_YIELD_AMOUNT (200_000_000)
+    // of LP yield, so u128::MAX + lp_yield would wrap.
+    let result = te.pool.try_receive_repayment(&invoice_id, &DEFAULT_FACE_VALUE);
+    let error = std::format!("{result:?}");
+    assert!(
+        result.is_err(),
+        "overflowing yield credit must be rejected: {error}"
+    );
+    assert!(
+        error.contains("#13"),
+        "expected PoolError::Overflow: {error}"
+    );
+
+    let after = te.pool.get_stats();
+    assert_eq!(
+        after.total_deposits, u128::MAX,
+        "TotalDeposits must not wrap on overflow"
+    );
+    assert_eq!(
+        after.total_yield_distributed, before.total_yield_distributed,
+        "TotalYieldDistributed must not change on overflow"
+    );
+    assert_eq!(
+        after.total_funded, before.total_funded,
+        "TotalFunded must not change on overflow"
+    );
+    assert_eq!(
+        after.active_invoice_count, before.active_invoice_count,
+        "active invoice count must not change on overflow"
+    );
+    // The funded invoice entry must survive the rejected settlement: the
+    // Overflow check fires before it is removed.
+    assert_eq!(
+        te.pool.get_funded_amount(&invoice_id),
+        Some(DEFAULT_FUNDED_AMOUNT),
+        "the funded invoice entry must not be removed on overflow"
+    );
+    assert_eq!(
+        usdc.balance(&te.pool_id),
+        pool_balance_before,
+        "pool token balance must not change on overflow"
+    );
+    assert_eq!(
+        te.env.events().all().len(),
+        events_before,
+        "no repayment event may be emitted on overflow"
+    );
+}
+
+#[test]
+fn test_receive_repayment_overflow_total_yield_preserves_state() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    te.pool.fund_invoice(&invoice_id);
+
+    // TotalDeposits has room; TotalYieldDistributed sits at the boundary, so
+    // the second checked credit is the one that must trip.
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalYieldDistributed, &u128::MAX);
+    });
+
+    let before = te.pool.get_stats();
+    let result = te.pool.try_receive_repayment(&invoice_id, &DEFAULT_FACE_VALUE);
+    let error = std::format!("{result:?}");
+    assert!(
+        result.is_err(),
+        "overflowing yield-distributed credit must be rejected: {error}"
+    );
+    assert!(
+        error.contains("#13"),
+        "expected PoolError::Overflow: {error}"
+    );
+
+    let after = te.pool.get_stats();
+    assert_eq!(after.total_deposits, before.total_deposits);
+    assert_eq!(after.total_yield_distributed, u128::MAX);
+    assert_eq!(after.total_funded, before.total_funded);
+    assert_eq!(after.active_invoice_count, before.active_invoice_count);
+    assert_eq!(
+        te.pool.get_funded_amount(&invoice_id),
+        Some(DEFAULT_FUNDED_AMOUNT),
+        "the funded invoice entry must not be removed on overflow"
+    );
+}
+
+// The boundary is inclusive: TotalDeposits seeded exactly one lp_yield below
+// u128::MAX must accept the credit and land exactly on the boundary.
+#[test]
+fn test_receive_repayment_succeeds_at_exact_total_deposits_boundary() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    te.pool.fund_invoice(&invoice_id);
+
+    te.env.as_contract(&te.pool_id, || {
+        te.env.storage().instance().set(
+            &DataKey::TotalDeposits,
+            &(u128::MAX - DEFAULT_YIELD_AMOUNT),
+        );
+    });
+
+    let result = te.pool.receive_repayment(&invoice_id, &DEFAULT_FACE_VALUE);
+    assert!(result);
+
+    let after = te.pool.get_stats();
+    assert_eq!(after.total_deposits, u128::MAX);
+    assert_eq!(after.total_yield_distributed, DEFAULT_YIELD_AMOUNT);
+    assert_eq!(after.total_funded, 0);
+    assert_eq!(after.active_invoice_count, 0);
+    assert_eq!(te.pool.get_funded_amount(&invoice_id), None);
+}
+
+// The refund entry point shares the same settlement path: an overflowing
+// yield credit must also block the buyer's refund transfer, leaving balances,
+// accounting, and the funded entry untouched.
+#[test]
+fn test_receive_repayment_with_refund_overflow_preserves_state_and_balances() {
+    let te = setup();
+    te.pool.deposit(&te.lp, &100_000_000_000);
+    let invoice_id = create_and_list(&te, &te.usdc_id);
+    te.pool.fund_invoice(&invoice_id);
+
+    te.env.as_contract(&te.pool_id, || {
+        te.env
+            .storage()
+            .instance()
+            .set(&DataKey::TotalDeposits, &u128::MAX);
+    });
+
+    let usdc = MockTokenClient::new(&te.env, &te.usdc_id);
+    let before = te.pool.get_stats();
+    let buyer_before = usdc.balance(&te.buyer);
+    let pool_before = usdc.balance(&te.pool_id);
+
+    let amount = DEFAULT_FACE_VALUE;
+    let refund = 50_000_000u128;
+    let result =
+        te.pool
+            .try_receive_repayment_with_refund(&invoice_id, &amount, &refund, &te.buyer);
+    let error = std::format!("{result:?}");
+    assert!(
+        result.is_err(),
+        "overflowing yield credit must be rejected: {error}"
+    );
+    assert!(
+        error.contains("#13"),
+        "expected PoolError::Overflow: {error}"
+    );
+
+    let after = te.pool.get_stats();
+    assert_eq!(after.total_deposits, u128::MAX);
+    assert_eq!(after.total_yield_distributed, before.total_yield_distributed);
+    assert_eq!(after.total_funded, before.total_funded);
+    assert_eq!(after.active_invoice_count, before.active_invoice_count);
+    assert_eq!(
+        usdc.balance(&te.buyer),
+        buyer_before,
+        "no refund may move on overflow"
+    );
+    assert_eq!(
+        usdc.balance(&te.pool_id),
+        pool_before,
+        "pool token balance must not change on overflow"
+    );
+    assert_eq!(
+        te.pool.get_funded_amount(&invoice_id),
+        Some(DEFAULT_FUNDED_AMOUNT),
+        "the funded invoice entry must not be removed on overflow"
+    );
+}
+
 // Mismatched repayment (active_count already zero) must NOT silently underflow the
 // counter to u32::MAX — the contract panics with #17 (ActiveCountUnderflow) instead.
 // Otherwise every subsequent `get_stats()` / utilization read is corrupted.
